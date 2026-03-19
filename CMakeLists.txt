@@ -23,21 +23,30 @@ include(${ITK_USE_FILE})
 # 3. Cari Package OpenCL
 find_package(OpenCL REQUIRED)
 
-# 4. Tentukan lokasi clFFT (Jika instalasi standar di /usr/local)
+# 4. N4 Bias Field Correction Method Selection
+option(USE_GPU_N4 "Use GPU-accelerated N4 (OpenCL). If OFF, use CPU-based ITK N4" OFF)
+if(USE_GPU_N4)
+    message(STATUS "N4 Bias Field Correction: GPU-accelerated (OpenCL)")
+    add_definitions(-DUSE_GPU_N4)
+else()
+    message(STATUS "N4 Bias Field Correction: CPU-based (ITK)")
+endif()
+
+# 5. Tentukan lokasi clFFT (Jika instalasi standar di /usr/local)
 # Jika Anda menginstal di lokasi berbeda, sesuaikan path berikut:
 include_directories(/usr/local/cuda/include)
 include_directories(/usr/local/include)
 
-# 5. Tambahkan Executable
+# 6. Tambahkan Executable
 add_executable(mri_recon main.cpp)
 
-# 6. Hubungkan Include Directories
+# 7. Hubungkan Include Directories
 target_include_directories(mri_recon PRIVATE 
     ${OpenCV_INCLUDE_DIRS} 
     ${OpenCL_INCLUDE_DIRS}
 )
 
-# 7. Hubungkan Libraries
+# 8. Hubungkan Libraries
 # Kita tambahkan clfft secara manual karena biasanya tidak memiliki find_package standar
 target_link_libraries(mri_recon 
     ${OpenCV_LIBS} 

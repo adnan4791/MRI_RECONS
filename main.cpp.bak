@@ -143,103 +143,8 @@ int main() {
     clfftDestroyPlan(&plan);
     clfftTeardown();
 
-#ifdef USE_GPU_N4
-    // GPU-accelerated N4 Bias Field Correction using OpenCL kernels
-    std::cout << "\nApplying GPU-accelerated N4 Bias Field Correction (OpenCL)..." << std::endl;
-    
-    // Load N4 kernels from program (already compiled from kernel.cl)
-    try {
-        // OpenCL buffers for 2D processing
-        size_t slice_size_n4 = dims.width * dims.height;
-        cl::Buffer buf_input(context, CL_MEM_READ_WRITE, slice_size_n4 * sizeof(float));
-        cl::Buffer buf_logImage(context, CL_MEM_READ_WRITE, slice_size_n4 * sizeof(float));
-        cl::Buffer buf_logBias1(context, CL_MEM_READ_WRITE, slice_size_n4 * sizeof(float));
-        cl::Buffer buf_logBias2(context, CL_MEM_READ_WRITE, slice_size_n4 * sizeof(float));
-        cl::Buffer buf_corrected(context, CL_MEM_READ_WRITE, slice_size_n4 * sizeof(float));
-        
-        // Process each slice with GPU N4 correction
-        for (size_t s = 0; s < dims.slices; ++s) {
-            std::vector<float> slice_data(volume_data.begin() + s * slice_size_n4, 
-                                          volume_data.begin() + (s + 1) * slice_size_n4);
-            
-            // Upload to GPU
-            queue.enqueueWriteBuffer(buf_input, CL_TRUE, 0, slice_size_n4 * sizeof(float), slice_data.data());
-            
-            // Convert to log domain
-            {
-                cl::Kernel k_log(program, "estimate_bias_kernel");
-                k_log.setArg(0, buf_input);
-                k_log.setArg(1, buf_logBias1);
-                k_log.setArg(2, buf_logImage);
-                k_log.setArg(3, (int)dims.width);
-                k_log.setArg(4, (int)dims.height);
-                k_log.setArg(5, 2);  // Radius for initial estimate
-                queue.enqueueNDRangeKernel(k_log, 0, cl::NDRange(dims.width, dims.height));
-                queue.finish();
-            }
-            
-            // Iterative refinement (3 iterations for speed)
-            for (int iter = 0; iter < 3; ++iter) {
-                cl::Kernel k_iter(program, "iterative_bias_estimation");
-                k_iter.setArg(0, buf_logImage);
-                k_iter.setArg(1, buf_logBias1);
-                k_iter.setArg(2, buf_logBias2);
-                k_iter.setArg(3, (int)dims.width);
-                k_iter.setArg(4, (int)dims.height);
-                k_iter.setArg(5, iter);  // Scale
-                k_iter.setArg(6, iter);  // Iteration
-                queue.enqueueNDRangeKernel(k_iter, 0, cl::NDRange(dims.width, dims.height));
-                queue.finish();
-                
-                // Swap buffers
-                cl::Buffer temp = buf_logBias1;
-                buf_logBias1 = buf_logBias2;
-                buf_logBias2 = temp;
-            }
-            
-            // Refine bias estimate
-            {
-                cl::Kernel k_refine(program, "refine_bias_estimate");
-                k_refine.setArg(0, buf_logBias1);
-                k_refine.setArg(1, buf_logBias2);
-                k_refine.setArg(2, (int)dims.width);
-                k_refine.setArg(3, (int)dims.height);
-                k_refine.setArg(4, 0.1f);  // Threshold
-                queue.enqueueNDRangeKernel(k_refine, 0, cl::NDRange(dims.width, dims.height));
-                queue.finish();
-            }
-            
-            // Apply correction
-            {
-                cl::Kernel k_apply(program, "apply_bias_correction");
-                k_apply.setArg(0, buf_input);
-                k_apply.setArg(1, buf_logBias2);
-                k_apply.setArg(2, buf_corrected);
-                k_apply.setArg(3, (int)dims.width);
-                k_apply.setArg(4, (int)dims.height);
-                queue.enqueueNDRangeKernel(k_apply, 0, cl::NDRange(dims.width, dims.height));
-                queue.finish();
-            }
-            
-            // Read back corrected slice
-            queue.enqueueReadBuffer(buf_corrected, CL_TRUE, 0, slice_size_n4 * sizeof(float), slice_data.data());
-            
-            // Update volume data
-            std::copy(slice_data.begin(), slice_data.end(), 
-                      volume_data.begin() + s * slice_size_n4);
-            
-            if (s % 5 == 0) {
-                std::cout << "GPU corrected slice " << s << "/" << dims.slices << std::endl;
-            }
-        }
-    } catch (const cl::Error &e) {
-        std::cerr << "Warning: GPU N4 correction failed: " << e.what() << std::endl;
-        std::cerr << "Continuing without N4 correction..." << std::endl;
-    }
-
-#else
-    // CPU-based 3D N4 Bias Field Correction using ITK
-    std::cout << "\nApplying CPU-based 3D N4 Bias Field Correction (ITK)..." << std::endl;
+    // Apply 3D N4 Bias Field Correction to entire volume with downsampling
+    std::cout << "\nApplying 3D N4 Bias Field Correction with downsampling..." << std::endl;
     {
         typedef float PixelType;
         typedef itk::Image< PixelType, 3 > ImageType3D;
@@ -266,29 +171,65 @@ int main() {
         // Import pixel data
         image3D->GetPixelContainer()->SetImportPointer( volume_data.data(), volume_data.size(), false );
         
-        // Apply optimized 3D N4 Bias Field Correction
+        // Downsample for faster bias field estimation
+        typedef itk::ShrinkImageFilter< ImageType3D, ImageType3D > ShrinkFilterType;
+        ShrinkFilterType::Pointer shrinkFilter = ShrinkFilterType::New();
+        shrinkFilter->SetInput( image3D );
+        
+        // Calculate downsampling factors (aim for ~64x64x64 or smaller)
+        unsigned int shrinkFactor[3];
+        shrinkFactor[0] = std::max(1u, static_cast<unsigned int>(dims.width / 64.0));
+        shrinkFactor[1] = std::max(1u, static_cast<unsigned int>(dims.height / 64.0));
+        shrinkFactor[2] = std::max(1u, static_cast<unsigned int>(dims.slices / 32.0));
+        
+        shrinkFilter->SetShrinkFactors( shrinkFactor );
+        shrinkFilter->Update();
+        ImageType3D::Pointer downsampledImage = shrinkFilter->GetOutput();
+        
+        std::cout << "Downsampled from " << dims.width << "x" << dims.height << "x" << dims.slices 
+                  << " to " << downsampledImage->GetLargestPossibleRegion().GetSize()[0] << "x"
+                  << downsampledImage->GetLargestPossibleRegion().GetSize()[1] << "x"
+                  << downsampledImage->GetLargestPossibleRegion().GetSize()[2] << std::endl;
+        
+        // Apply N4 on downsampled image
         typedef itk::N4BiasFieldCorrectionImageFilter< ImageType3D, ImageType3D > CorrecterType3D;
         CorrecterType3D::Pointer corrector3D = CorrecterType3D::New();
-        corrector3D->SetInput( image3D );
-        corrector3D->SetNumberOfFittingLevels( 3 );  // Reduced from 4 for speed
-        itk::Array<unsigned int> iterations(3);
-        iterations[0] = 20; iterations[1] = 20; iterations[2] = 20;  // Reduced from 50 for speed
+        corrector3D->SetInput( downsampledImage );
+        corrector3D->SetNumberOfFittingLevels( 4 );
+        itk::Array<unsigned int> iterations(4);
+        iterations[0] = 50; iterations[1] = 50; iterations[2] = 50; iterations[3] = 50;
         corrector3D->SetMaximumNumberOfIterations( iterations );
-        corrector3D->SetConvergenceThreshold( 0.01 );  // Relaxed from 0.001 for speed
+        corrector3D->SetConvergenceThreshold( 0.001 );
         corrector3D->SetNumberOfThreads( std::thread::hardware_concurrency() );
         corrector3D->Update();
-        ImageType3D::Pointer correctedImage3D = corrector3D->GetOutput();
-        correctedImage3D->DisconnectPipeline();
+        
+        // Get the bias field from the downsampled correction
+        typedef itk::BSplineControlPointImageFilter< 
+            itk::BSplineScatteredDataPointSetToImageFilter<
+                itk::PointSet< PixelType, 3 >, ImageType3D >, ImageType3D > BSplineFilterType;
+        BSplineFilterType::Pointer bsplineFilter = BSplineFilterType::New();
+        bsplineFilter->SetInput( corrector3D->GetLogBiasFieldControlPointLattice() );
+        bsplineFilter->SetSplineOrder( corrector3D->GetSplineOrder() );
+        bsplineFilter->SetSize( image3D->GetLargestPossibleRegion().GetSize() );
+        bsplineFilter->SetOrigin( image3D->GetOrigin() );
+        bsplineFilter->SetSpacing( image3D->GetSpacing() );
+        bsplineFilter->SetDirection( image3D->GetDirection() );
+        bsplineFilter->Update();
+        
+        // Apply bias field correction to original resolution image
+        typedef itk::MultiplyImageFilter< ImageType3D, ImageType3D, ImageType3D > MultiplyFilterType;
+        MultiplyFilterType::Pointer multiplyFilter = MultiplyFilterType::New();
+        multiplyFilter->SetInput1( image3D );
+        multiplyFilter->SetInput2( bsplineFilter->GetOutput() );
+        multiplyFilter->Update();
         
         // Copy corrected data back
-        itk::ImageRegionConstIterator<ImageType3D> it(correctedImage3D, correctedImage3D->GetLargestPossibleRegion());
+        itk::ImageRegionConstIterator<ImageType3D> it(multiplyFilter->GetOutput(), multiplyFilter->GetOutput()->GetLargestPossibleRegion());
         size_t i = 0;
         for (it.GoToBegin(); !it.IsAtEnd(); ++it, ++i) {
             volume_data[i] = it.Get();
         }
     }
-
-#endif
     
     // Find global min/max for consistent scaling across all slices
     float global_min = *std::min_element(volume_data.begin(), volume_data.end());
