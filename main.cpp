@@ -1,10 +1,17 @@
 #include <iostream>
 #include <vector>
+#include <thread>
 #define __CL_ENABLE_EXCEPTIONS
 #include <CL/cl.hpp>
 #include <clFFT.h>
 #include <opencv2/opencv.hpp>
 #include "mri_utils.hpp"
+
+// ITK includes for N4 Bias Field Correction
+#include "itkImage.h"
+#include "itkN4BiasFieldCorrectionImageFilter.h"
+#include "itkImportImageFilter.h"
+#include "itkImageRegionConstIterator.h"
 
 // Define OpenCL vector types if not available
 typedef cl_float2 float2;
@@ -68,6 +75,9 @@ int main() {
 
     std::ifstream cfl(base_path + ".cfl", std::ios::binary);
     std::vector<std::complex<float>> host_data(slice_size * dims.coils);
+    
+    // Store all reconstructed slices for 3D N4 bias field correction
+    std::vector<float> volume_data(slice_size * dims.slices);
 
     for (size_t s = 0; s < dims.slices; ++s) {
         cfl.read((char*)host_data.data(), host_data.size() * 8);
@@ -84,15 +94,15 @@ int main() {
         queue.finish();
 
         // 2. Fermi filter
-        cl::Kernel k_fermi(program, "fermi_filter");
-        k_fermi.setArg(0, buf_temp);
-        k_fermi.setArg(1, (int)dims.width);
-        k_fermi.setArg(2, (int)dims.height);
-        k_fermi.setArg(3, (int)dims.coils);
-        k_fermi.setArg(4, 150.0f);  // More conservative radius (93% of Nyquist)
-        k_fermi.setArg(5, 30.0f);   // Smoother transition
-        queue.enqueueNDRangeKernel(k_fermi, 0, cl::NDRange(dims.width, dims.height));
-        queue.finish();
+       // cl::Kernel k_fermi(program, "fermi_filter");
+       // k_fermi.setArg(0, buf_temp);
+       // k_fermi.setArg(1, (int)dims.width);
+       // k_fermi.setArg(2, (int)dims.height);
+       // k_fermi.setArg(3, (int)dims.coils);
+       // k_fermi.setArg(4, 150.0f);  // More conservative radius (93% of Nyquist)
+       // k_fermi.setArg(5, 30.0f);   // Smoother transition
+      //  queue.enqueueNDRangeKernel(k_fermi, 0, cl::NDRange(dims.width, dims.height));
+      //  queue.finish();
 
         // 3. Copy filtered k-space back to buf_kspace
         queue.enqueueCopyBuffer(buf_temp, buf_kspace, 0, 0, slice_size * dims.coils * sizeof(float2));
@@ -111,6 +121,7 @@ int main() {
         queue.enqueueNDRangeKernel(k_shift2, 0, cl::NDRange(dims.width, dims.height));
         queue.finish();
 
+        
         // 3. RSS + Normalisasi
         cl::Kernel k_rss(program, "rss_normalized");
         k_rss.setArg(0, buf_temp); k_rss.setArg(1, buf_out);
@@ -124,34 +135,83 @@ int main() {
             return -1;
         }
 
-        // 4. Save dengan OpenCV
-        std::vector<float> final_img(slice_size);
-        queue.enqueueReadBuffer(buf_out, CL_TRUE, 0, slice_size * 4, final_img.data());
-        
-        cv::Mat mat(dims.height, dims.width, CV_32FC1, final_img.data());
-        
-        // Better scaling: use percentile-based contrast stretching
-        cv::Mat sorted_mat;
-        cv::sort(mat.reshape(1, 1), sorted_mat, cv::SORT_ASCENDING);
-        float p1 = sorted_mat.at<float>(sorted_mat.total() * 0.01);  // 1st percentile
-        float p99 = sorted_mat.at<float>(sorted_mat.total() * 0.99); // 99th percentile
-        
-        cv::Mat scaled;
-        if (p99 <= p1) {
-            // Fallback to min/max scaling
-            double min_val, max_val;
-            cv::minMaxLoc(mat, &min_val, &max_val);
-            mat.convertTo(scaled, CV_8UC1, 255.0 / (max_val - min_val), -255.0 * min_val / (max_val - min_val));
-        } else {
-            mat.convertTo(scaled, CV_8UC1, 255.0 / (p99 - p1), -255.0 * p1 / (p99 - p1));
-        }
-        
-        cv::imwrite("output/slice_" + std::to_string(s) + ".png", scaled);
-        
-        std::cout << "Processed slice " << s << std::endl;
+        // 4. Read reconstructed slice and store in volume
+        queue.enqueueReadBuffer(buf_out, CL_TRUE, 0, slice_size * 4, volume_data.data() + s * slice_size);
+        std::cout << "Reconstructed slice " << s << std::endl;
     }
 
     clfftDestroyPlan(&plan);
     clfftTeardown();
+
+    // Apply 3D N4 Bias Field Correction to entire volume (optimized for speed)
+    std::cout << "\nApplying optimized 3D N4 Bias Field Correction..." << std::endl;
+    {
+        typedef float PixelType;
+        typedef itk::Image< PixelType, 3 > ImageType3D;
+        
+        // Create 3D ITK image from volume data
+        ImageType3D::Pointer image3D = ImageType3D::New();
+        ImageType3D::RegionType region;
+        ImageType3D::IndexType start;
+        start[0] = 0; start[1] = 0; start[2] = 0;
+        ImageType3D::SizeType size3D;
+        size3D[0] = dims.width; size3D[1] = dims.height; size3D[2] = dims.slices;
+        region.SetSize( size3D );
+        region.SetIndex( start );
+        image3D->SetRegions( region );
+        
+        ImageType3D::SpacingType spacing;
+        spacing[0] = 1.0; spacing[1] = 1.0; spacing[2] = 1.0;
+        image3D->SetSpacing( spacing );
+        
+        ImageType3D::PointType origin;
+        origin[0] = 0.0; origin[1] = 0.0; origin[2] = 0.0;
+        image3D->SetOrigin( origin );
+        
+        // Import pixel data
+        image3D->GetPixelContainer()->SetImportPointer( volume_data.data(), volume_data.size(), false );
+        
+        // Apply optimized 3D N4 Bias Field Correction
+        typedef itk::N4BiasFieldCorrectionImageFilter< ImageType3D, ImageType3D > CorrecterType3D;
+        CorrecterType3D::Pointer corrector3D = CorrecterType3D::New();
+        corrector3D->SetInput( image3D );
+        corrector3D->SetNumberOfFittingLevels( 3 );  // Reduced from 4 for speed
+        itk::Array<unsigned int> iterations(3);
+        iterations[0] = 20; iterations[1] = 20; iterations[2] = 20;  // Reduced from 50 for speed
+        corrector3D->SetMaximumNumberOfIterations( iterations );
+        corrector3D->SetConvergenceThreshold( 0.01 );  // Relaxed from 0.001 for speed
+        corrector3D->SetNumberOfThreads( std::thread::hardware_concurrency() );
+        corrector3D->Update();
+        ImageType3D::Pointer correctedImage3D = corrector3D->GetOutput();
+        correctedImage3D->DisconnectPipeline();
+        
+        // Copy corrected data back
+        itk::ImageRegionConstIterator<ImageType3D> it(correctedImage3D, correctedImage3D->GetLargestPossibleRegion());
+        size_t i = 0;
+        for (it.GoToBegin(); !it.IsAtEnd(); ++it, ++i) {
+            volume_data[i] = it.Get();
+        }
+    }
+    
+    // Find global min/max for consistent scaling across all slices
+    float global_min = *std::min_element(volume_data.begin(), volume_data.end());
+    float global_max = *std::max_element(volume_data.begin(), volume_data.end());
+    
+    // Save all slices after bias field correction
+    std::cout << "\nSaving corrected slices..." << std::endl;
+    for (size_t s = 0; s < dims.slices; ++s) {
+        cv::Mat mat(dims.height, dims.width, CV_32FC1, volume_data.data() + s * slice_size);
+        
+        cv::Mat scaled;
+        if (global_max <= global_min) {
+            mat.convertTo(scaled, CV_8UC1, 1.0);
+        } else {
+            mat.convertTo(scaled, CV_8UC1, 255.0 / (global_max - global_min), -255.0 * global_min / (global_max - global_min));
+        }
+        
+        cv::imwrite("output/slice_" + std::to_string(s) + ".png", scaled);
+        std::cout << "Saved slice " << s << std::endl;
+    }
+    
     return 0;
 }
