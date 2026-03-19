@@ -16,6 +16,10 @@ set(OpenCV_DIR "C:/opencv/build")
 # 2. Cari Package OpenCV
 find_package(OpenCV REQUIRED)
 
+# Cari Package ITK
+find_package(ITK REQUIRED)
+include(${ITK_USE_FILE})
+
 # 3. Cari Package OpenCL
 find_package(OpenCL REQUIRED)
 
@@ -38,6 +42,7 @@ target_include_directories(mri_recon PRIVATE
 target_link_libraries(mri_recon 
     ${OpenCV_LIBS} 
     ${OpenCL_LIBRARIES} 
+    ${ITK_LIBRARIES}
     clFFT
 )
 

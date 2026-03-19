@@ -47,3 +47,42 @@ __kernel void rss_normalized(__global float2* input, __global float* output, int
     }
     output[i] = sqrt(sum_sq);
 }
+
+// Kernel untuk estimasi bias field (Simple Low-pass approach)
+__kernel void estimate_bias_kernel(
+    __global const float* inputImage,
+    __global float* biasField,
+    __global float* outputImage,
+    const int width,
+    const int height,
+    const int radius) 
+{
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+
+    if (x >= width || y >= height) return;
+
+    float sumLog = 0.0f;
+    int count = 0;
+
+    // Local Averaging in Log Domain (Approximating B-Spline smooth)
+    for (int ky = -radius; ky <= radius; ky++) {
+        for (int kx = -radius; kx <= radius; kx++) {
+            int nx = x + kx;
+            int ny = y + ky;
+
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                float val = inputImage[ny * width + nx];
+                // Tambahkan epsilon untuk menghindari log(0)
+                sumLog += log(val + 1e-6f);
+                count++;
+            }
+        }
+    }
+
+    float logBias = sumLog / count;
+    biasField[y * width + x] = logBias;
+
+    // Koreksi: I_out = I_in / exp(logBias)
+    outputImage[y * width + x] = inputImage[y * width + x] / exp(logBias);
+}
